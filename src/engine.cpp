@@ -32,6 +32,22 @@ void slot_get(const uint8_t* p, uint16_t i, uint16_t& off, uint16_t& len) {
 void check_heap(const uint8_t* p, PageId pid) {
   if (load_u32(p + kMagicOff) != kHeapMagic) throw DbError("page " + std::to_string(pid) + " is not a heap page");
 }
+// Number of slots on a heap page, after checking that the slot directory fits in the page.
+uint16_t checked_slot_count(const uint8_t* p, PageId pid) {
+  uint16_t n = slot_count(p);
+  if (kSlotsOff + kSlotSize * size_t{n} > kPageSize)
+    throw DbError("page " + std::to_string(pid) + " has a slot directory larger than the page");
+  return n;
+}
+// Reads slot i (< checked_slot_count) and checks that its value lies between the slot directory and
+// the end of the page. Returns false for a free slot.
+bool read_slot(const uint8_t* p, PageId pid, uint16_t i, uint16_t n, uint16_t& off, uint16_t& len) {
+  slot_get(p, i, off, len);
+  if (off == 0) return false;
+  if (off < kSlotsOff + kSlotSize * size_t{n} || size_t{off} + len > kPageSize)
+    throw DbError("page " + std::to_string(pid) + " slot " + std::to_string(i) + " is out of bounds");
+  return true;
+}
 }  // namespace
 
 Engine::Engine(const std::string& dir, Options opt) : dir_(dir), opt_(opt) {
@@ -149,10 +165,10 @@ bool Engine::remove(Rid rid) {
   if (rid.page == 0 || rid.page >= page_count_) return false;
   const uint8_t* rp = pool_->fetch(rid.page);
   check_heap(rp, rid.page);
-  if (rid.slot >= slot_count(rp)) return false;
+  uint16_t n = checked_slot_count(rp, rid.page);
+  if (rid.slot >= n) return false;
   uint16_t off, len;
-  slot_get(rp, rid.slot, off, len);
-  if (off == 0) return false;
+  if (!read_slot(rp, rid.page, rid.slot, n, off, len)) return false;
   uint8_t* p = pool_->fetch_for_write(rid.page);
   store_u16(p + kSlotsOff + kSlotSize * rid.slot, 0);
   store_u16(p + kSlotsOff + kSlotSize * rid.slot + 2, 0);
@@ -164,10 +180,10 @@ std::optional<std::string> Engine::get(Rid rid) {
   if (rid.page == 0 || rid.page >= page_count_) return std::nullopt;
   const uint8_t* p = pool_->fetch(rid.page);
   check_heap(p, rid.page);
-  if (rid.slot >= slot_count(p)) return std::nullopt;
+  uint16_t n = checked_slot_count(p, rid.page);
+  if (rid.slot >= n) return std::nullopt;
   uint16_t off, len;
-  slot_get(p, rid.slot, off, len);
-  if (off == 0) return std::nullopt;
+  if (!read_slot(p, rid.page, rid.slot, n, off, len)) return std::nullopt;
   return std::string(reinterpret_cast<const char*>(p + off), len);
 }
 
@@ -176,13 +192,10 @@ void Engine::scan(const std::function<void(Rid, std::string_view)>& fn) {
   for (PageId pid = 1; pid < page_count_; ++pid) {
     std::memcpy(copy, pool_->fetch(pid), kPageSize);  // fn may call back into the engine
     check_heap(copy, pid);
-    uint16_t n = slot_count(copy);
+    uint16_t n = checked_slot_count(copy, pid);
     for (uint16_t i = 0; i < n; ++i) {
       uint16_t off, len;
-      slot_get(copy, i, off, len);
-      if (off == 0) continue;
-      if (off < kSlotsOff + kSlotSize * n || off + len > kPageSize)
-        throw DbError("page " + std::to_string(pid) + " slot " + std::to_string(i) + " is out of bounds");
+      if (!read_slot(copy, pid, i, n, off, len)) continue;
       fn(Rid{pid, i}, std::string_view(reinterpret_cast<const char*>(copy + off), len));
     }
   }

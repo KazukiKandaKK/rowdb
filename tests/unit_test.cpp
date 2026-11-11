@@ -2,6 +2,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <functional>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -209,6 +210,64 @@ static void test_steal_abort_then_reopen() {
   CHECK(!rows.empty() && rows[0] == "committed");
 }
 
+// Overwrites slot `slot` of page `page` in data.db (offset/length, little-endian) and re-seals the page,
+// so the page passes its CRC check and only the slot bounds can catch the damage.
+static void corrupt_slot(const std::string& dir, PageId page, uint16_t slot, uint16_t off, uint16_t len) {
+  FILE* f = std::fopen((dir + "/data.db").c_str(), "r+b");
+  CHECK(f != nullptr);
+  if (!f) return;
+  uint8_t buf[kPageSize];
+  std::fseek(f, static_cast<long>(page) * kPageSize, SEEK_SET);
+  CHECK(std::fread(buf, 1, kPageSize, f) == kPageSize);
+  const size_t at = 12 + 4 * size_t{slot};  // slot directory layout from engine.cpp (kSlotsOff, kSlotSize)
+  store_u16(buf + at, off);
+  store_u16(buf + at + 2, len);
+  seal_page(buf);
+  std::fseek(f, static_cast<long>(page) * kPageSize, SEEK_SET);
+  CHECK(std::fwrite(buf, 1, kPageSize, f) == kPageSize);
+  std::fclose(f);
+}
+
+static bool throws_db_error(const std::function<void()>& fn) {
+  try {
+    fn();
+  } catch (const DbError&) {
+    return true;
+  }
+  return false;
+}
+
+static void test_get_bounds() {
+  auto d = fresh_dir("getbounds");
+  Rid a, b;
+  {
+    Engine db(d, Options{});
+    db.begin();
+    a = db.insert("first");
+    b = db.insert("second");
+    db.commit();
+  }  // clean close: checkpoint writes page 1 to data.db and empties the WAL
+  {
+    Engine db(d, Options{});
+    CHECK(db.get(a).value_or("") == "first");
+    CHECK(!db.get(Rid{a.page, 0xFFFF}).has_value());  // past the last slot
+    CHECK(!db.get(Rid{0, 0}).has_value());              // meta page
+    CHECK(!db.get(Rid{a.page + 100, 0}).has_value());   // past the last page
+  }
+  corrupt_slot(d, b.page, b.slot, 4090, 100);  // value would run past the end of the page
+  {
+    Engine db(d, Options{});
+    CHECK(db.get(a).value_or("") == "first");  // the intact slot still reads
+    CHECK(throws_db_error([&] { db.get(b); }));
+    CHECK(throws_db_error([&] { db.scan([](Rid, std::string_view) {}); }));
+  }
+  corrupt_slot(d, b.page, b.slot, 4, 4);  // value would overlap the page header / slot directory
+  {
+    Engine db(d, Options{});
+    CHECK(throws_db_error([&] { db.get(b); }));
+  }
+}
+
 int main() {
   test_basic_and_reopen();
   test_abort_restores();
@@ -218,6 +277,7 @@ int main() {
   test_txn_too_large();
   test_txn_too_large_keeps_page_count();
   test_steal_abort_then_reopen();
+  test_get_bounds();
   if (failures) {
     std::cerr << failures << " check(s) failed\n";
     return 1;

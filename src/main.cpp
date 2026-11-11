@@ -9,6 +9,7 @@
 //       the second "L <live rows> <us>" once the startup scan has finished.
 //   rowdb dump --dir D [--bug ...] [--frames N]
 //       Opens (and recovers) the database and prints every live row as "<page> <slot> <value>".
+//       Every printed row is also read back with get() and must match (exit 3 otherwise).
 //       Recovery statistics go to stderr.
 
 #include <fcntl.h>
@@ -140,11 +141,26 @@ int run_dump(const std::map<std::string, std::string>& a) {
             << " pages_redone=" << rs.pages_redone << " discarded_records=" << rs.discarded_records
             << " wal_tail_bytes=" << rs.wal_tail_bytes << "\n";
   std::string out;
+  std::vector<std::pair<Rid, std::string>> rows;
   db.scan([&](Rid r, std::string_view v) {
+    rows.emplace_back(r, std::string(v));
     out += std::to_string(r.page) + " " + std::to_string(r.slot) + " ";
     out.append(v.data(), v.size());
     out += "\n";
   });
+  // Cross-check the point lookup against the scan: every scanned row must read back the same through
+  // get(), and slots past the end of a page (and page 0, the meta page) must read as absent.
+  for (const auto& [r, v] : rows) {
+    auto g = db.get(r);
+    if (!g || *g != v) {
+      std::cerr << "dump: get(" << r.page << "," << r.slot << ") disagrees with scan\n";
+      return 3;
+    }
+    if (db.get(Rid{r.page, 0xFFFF}) || db.get(Rid{0, r.slot})) {
+      std::cerr << "dump: get() returned a row for a slot that cannot exist\n";
+      return 3;
+    }
+  }
   std::fwrite(out.data(), 1, out.size(), stdout);
   return 0;
 }
