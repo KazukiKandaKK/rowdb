@@ -20,11 +20,9 @@ constexpr size_t kSlotSize = 4;
 
 uint16_t slot_count(const uint8_t* p) { return load_u16(p + kSlotCountOff); }
 uint16_t free_end(const uint8_t* p) { return load_u16(p + kFreeEndOff); }
-size_t free_space(const uint8_t* p) {
-  size_t used_front = kSlotsOff + kSlotSize * slot_count(p);
-  size_t fe = free_end(p);
-  return fe > used_front ? fe - used_front : 0;
-}
+// Free bytes between the slot directory and the values. Throws if free_end does not lie between
+// the end of the slot directory and the end of the page (insert writes at free_end - size).
+size_t checked_free_space(const uint8_t* p, PageId pid);
 void slot_get(const uint8_t* p, uint16_t i, uint16_t& off, uint16_t& len) {
   off = load_u16(p + kSlotsOff + kSlotSize * i);
   len = load_u16(p + kSlotsOff + kSlotSize * i + 2);
@@ -38,6 +36,13 @@ uint16_t checked_slot_count(const uint8_t* p, PageId pid) {
   if (kSlotsOff + kSlotSize * size_t{n} > kPageSize)
     throw DbError("page " + std::to_string(pid) + " has a slot directory larger than the page");
   return n;
+}
+size_t checked_free_space(const uint8_t* p, PageId pid) {
+  size_t used_front = kSlotsOff + kSlotSize * size_t{checked_slot_count(p, pid)};
+  size_t fe = free_end(p);
+  if (fe < used_front || fe > kPageSize)
+    throw DbError("page " + std::to_string(pid) + " has free_end outside the page");
+  return fe - used_front;
 }
 // Reads slot i (< checked_slot_count) and checks that its value lies between the slot directory and
 // the end of the page. Returns false for a free slot.
@@ -136,7 +141,7 @@ Rid Engine::insert(std::string_view value) {
     PageId last = page_count_ - 1;
     const uint8_t* rp = pool_->fetch(last);
     check_heap(rp, last);
-    if (free_space(rp) >= need) {
+    if (checked_free_space(rp, last) >= need) {
       pid = last;
       p = pool_->fetch_for_write(last);
     }

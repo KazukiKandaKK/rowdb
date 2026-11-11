@@ -32,7 +32,7 @@ for d in runs/$L-*; do
   python3 -c "
 import json
 s=json.load(open('$d/summary.json'))
-keys=['bug','frames','cycles','killed_by_sigkill','exited_before_kill','killed_before_load','txn_phase_kills','checks','pass','fail','harness_errors','stalled_cycles','indoubt_seen','indoubt_present','indoubt_absent','acked_txns','wal_tail_seen','elapsed_s','verdict']
+keys=['bug','frames','cycles','killed_by_sigkill','exited_before_kill','killed_before_load','txn_phase_kills','checks','pass','fail','state_mismatch','startup_checks','startup_mismatch','harness_errors','stalled_cycles','indoubt_seen','indoubt_present','indoubt_absent','indoubt_noop','acked_txns','wal_tail_seen','elapsed_s','verdict']
 print('$d', {k:s[k] for k in keys})"
 done
 du -sh runs

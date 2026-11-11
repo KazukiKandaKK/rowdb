@@ -228,6 +228,21 @@ static void corrupt_slot(const std::string& dir, PageId page, uint16_t slot, uin
   std::fclose(f);
 }
 
+// Overwrites a 2-byte header field of page `page` in data.db and re-seals the page.
+static void corrupt_u16(const std::string& dir, PageId page, size_t at, uint16_t v) {
+  FILE* f = std::fopen((dir + "/data.db").c_str(), "r+b");
+  CHECK(f != nullptr);
+  if (!f) return;
+  uint8_t buf[kPageSize];
+  std::fseek(f, static_cast<long>(page) * kPageSize, SEEK_SET);
+  CHECK(std::fread(buf, 1, kPageSize, f) == kPageSize);
+  store_u16(buf + at, v);
+  seal_page(buf);
+  std::fseek(f, static_cast<long>(page) * kPageSize, SEEK_SET);
+  CHECK(std::fwrite(buf, 1, kPageSize, f) == kPageSize);
+  std::fclose(f);
+}
+
 static bool throws_db_error(const std::function<void()>& fn) {
   try {
     fn();
@@ -260,11 +275,60 @@ static void test_get_bounds() {
     CHECK(db.get(a).value_or("") == "first");  // the intact slot still reads
     CHECK(throws_db_error([&] { db.get(b); }));
     CHECK(throws_db_error([&] { db.scan([](Rid, std::string_view) {}); }));
+    db.begin();
+    CHECK(throws_db_error([&] { db.remove(b); }));
+    db.abort();
   }
   corrupt_slot(d, b.page, b.slot, 4, 4);  // value would overlap the page header / slot directory
   {
     Engine db(d, Options{});
     CHECK(throws_db_error([&] { db.get(b); }));
+  }
+
+  // slot count too large for the page: every path that reads the slot directory must refuse
+  auto d2 = fresh_dir("getbounds2");
+  Rid c;
+  {
+    Engine db(d2, Options{});
+    db.begin();
+    c = db.insert("only");
+    db.commit();
+  }
+  corrupt_u16(d2, c.page, 4, 2000);  // kSlotCountOff; 12 + 4 * 2000 > 4096
+  {
+    Engine db(d2, Options{});
+    CHECK(throws_db_error([&] { db.get(c); }));
+    CHECK(throws_db_error([&] { db.scan([](Rid, std::string_view) {}); }));
+    db.begin();
+    CHECK(throws_db_error([&] { db.remove(c); }));
+    CHECK(throws_db_error([&] { db.insert("x"); }));  // c.page is the last page, so insert looks at it
+    db.abort();
+  }
+
+  // free_end past the end of the page: insert would write outside the page buffer
+  auto d3 = fresh_dir("getbounds3");
+  {
+    Engine db(d3, Options{});
+    db.begin();
+    c = db.insert("only");
+    db.commit();
+  }
+  corrupt_u16(d3, c.page, 6, 60000);  // kFreeEndOff
+  {
+    Engine db(d3, Options{});
+    CHECK(db.get(c).value_or("") == "only");  // reads do not depend on free_end
+    db.begin();
+    CHECK(throws_db_error([&] { db.insert("x"); }));
+    db.abort();
+  }
+  // free_end inside the header / slot directory (one slot: the directory ends at 16)
+  corrupt_u16(d3, c.page, 6, 8);
+  {
+    Engine db(d3, Options{});
+    CHECK(db.get(c).value_or("") == "only");
+    db.begin();
+    CHECK(throws_db_error([&] { db.insert("x"); }));
+    db.abort();
   }
 }
 

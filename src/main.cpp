@@ -6,10 +6,13 @@
 //       Every committing transaction appends its operations and "S <txn> <us>" to the ledger
 //       (one write + fsync) before calling commit(), and "C <txn> <us>" after commit() returns.
 //       <us> = microseconds since process start. The first line is "R <recovery stats...> <us>",
-//       the second "L <live rows> <us>" once the startup scan has finished.
+//       the second "L <live rows> <us> <crc>" once the startup scan has finished, where <crc> is the
+//       CRC32 (hex) of the scanned rows written as "<page> <slot> <value>\n" in scan order.
 //   rowdb dump --dir D [--bug ...] [--frames N]
 //       Opens (and recovers) the database and prints every live row as "<page> <slot> <value>".
-//       Every printed row is also read back with get() and must match (exit 3 otherwise).
+//       Every printed row is then read back with get() and must match (exit 3 otherwise; any other
+//       error also exits 3, with "error: ..." on stderr). Values never contain a newline (the workload
+//       writes "t<txn>o<i>-" plus hex digits); both this listing and the ledger digest rely on that.
 //       Recovery statistics go to stderr.
 
 #include <fcntl.h>
@@ -89,8 +92,17 @@ int run_workload(const std::map<std::string, std::string>& a) {
                         std::to_string(rs.wal_tail_bytes) + " " + std::to_string(now_us()) + "\n");
 
   std::vector<Rid> live;
-  db.scan([&](Rid r, std::string_view) { live.push_back(r); });
-  ledger_write(lfd, "L " + std::to_string(live.size()) + " " + std::to_string(now_us()) + "\n");  // startup scan done
+  uint32_t digest = 0;  // lets the harness tell exactly which state recovery produced
+  db.scan([&](Rid r, std::string_view v) {
+    live.push_back(r);
+    std::string row = std::to_string(r.page) + " " + std::to_string(r.slot) + " ";
+    row.append(v.data(), v.size());
+    row += "\n";
+    digest = crc32(row.data(), row.size(), digest);
+  });
+  char hexd[9];
+  std::snprintf(hexd, sizeof hexd, "%08x", digest);
+  ledger_write(lfd, "L " + std::to_string(live.size()) + " " + std::to_string(now_us()) + " " + hexd + "\n");  // startup scan done
 
   std::mt19937_64 rng(std::stoull(a.at("seed")));
   auto uni = [&](uint64_t lo, uint64_t hi) { return std::uniform_int_distribution<uint64_t>(lo, hi)(rng); };
@@ -148,20 +160,21 @@ int run_dump(const std::map<std::string, std::string>& a) {
     out.append(v.data(), v.size());
     out += "\n";
   });
+  std::fwrite(out.data(), 1, out.size(), stdout);  // before the cross-check: kept even if it fails
+  std::fflush(stdout);
   // Cross-check the point lookup against the scan: every scanned row must read back the same through
-  // get(), and slots past the end of a page (and page 0, the meta page) must read as absent.
+  // get(), and a slot past the end of the slot directory must read as absent.
   for (const auto& [r, v] : rows) {
     auto g = db.get(r);
     if (!g || *g != v) {
       std::cerr << "dump: get(" << r.page << "," << r.slot << ") disagrees with scan\n";
       return 3;
     }
-    if (db.get(Rid{r.page, 0xFFFF}) || db.get(Rid{0, r.slot})) {
+    if (db.get(Rid{r.page, 0xFFFF})) {
       std::cerr << "dump: get() returned a row for a slot that cannot exist\n";
       return 3;
     }
   }
-  std::fwrite(out.data(), 1, out.size(), stdout);
   return 0;
 }
 

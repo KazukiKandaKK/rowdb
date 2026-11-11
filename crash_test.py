@@ -7,6 +7,11 @@ Every checked state must equal the state built from the ledger:
   - nothing else (aborted, never committed) is present.
 Sometimes the check is skipped so that the next workload run performs recovery itself and can be
 killed in the middle of it; the following check then covers both runs.
+
+Every workload run also records a CRC32 of the rows its startup scan saw (ledger line "L"). Before a
+cycle's own transactions are added, the harness checks that this startup state is one of the allowed
+states. That settles the in-doubt transactions of unchecked cycles at the next startup, so a row that
+recovery once made visible cannot quietly disappear before the next dump check.
 """
 import argparse
 import json
@@ -17,11 +22,12 @@ import signal
 import subprocess
 import sys
 import time
+import zlib
 
 
 def parse_ledger(path):
     txns, order, recov = {}, [], []
-    times = {"S": {}, "C": {}, "L": None}
+    times = {"S": {}, "C": {}, "L": None, "L_rows": None, "L_crc": None}
     if not os.path.exists(path):
         return txns, order, recov, times
     with open(path) as f:
@@ -34,6 +40,9 @@ def parse_ledger(path):
                 continue
             if p[0] == "L":
                 times["L"] = int(p[2])
+                times["L_rows"] = int(p[1])
+                if len(p) > 3:
+                    times["L_crc"] = int(p[3], 16)
                 continue
             t = int(p[1])
             if t not in txns:
@@ -70,6 +79,35 @@ def apply_ops(model, ops):
             del model[rid]
 
 
+def net_noop(ops):
+    """True if the operations cancel out (every inserted row is deleted again in the same transaction
+    and nothing else is deleted). Applying or omitting such a transaction gives the same state, so the
+    check cannot tell which happened. Row ids are never reused, so this depends on the ops alone."""
+    ins = set()
+    for kind, rid, _ in ops:
+        if kind == "I":
+            ins.add(rid)
+        elif rid in ins:
+            ins.discard(rid)
+        else:
+            return False
+    return not ins
+
+
+def count_indoubt(s, segments, chosen):
+    """Add the outcome of the carried in-doubt transactions, as chosen by the matching state, to the
+    counters. Transactions that cancel out are counted separately: either outcome fits."""
+    for t, o, d in segments:
+        if d:
+            continue
+        if net_noop(o):
+            s["indoubt_noop"] += 1
+        elif t in chosen:
+            s["indoubt_present"] += 1
+        else:
+            s["indoubt_absent"] += 1
+
+
 def candidates(model, segments):
     """segments: list of (txn, ops, definite). Yields (state, chosen in-doubt txns)."""
     states = [(dict(model), [])]
@@ -94,13 +132,31 @@ def candidates(model, segments):
     return states
 
 
+def state_crc(state):
+    """CRC32 of a state in the workload's startup-scan format (rows in (page, slot) order)."""
+    c = 0
+    for (pg, sl), val in sorted(state.items()):
+        c = zlib.crc32(f"{pg} {sl} {val}\n".encode(), c)
+    return c
+
+
+def resolve_startup(model, segments, rows, crc):
+    """Find the allowed state that a workload's startup scan saw. Returns (state, chosen in-doubt txns)
+    or None if the scan matches no allowed state."""
+    for st, chosen in candidates(model, segments):
+        if len(st) == rows and state_crc(st) == crc:
+            return st, chosen
+    return None
+
+
 def dump(binary, db, engine_args):
     r = subprocess.run([binary, "dump", "--dir", db] + engine_args, capture_output=True, text=True)
+    # The listing is written before dump's own get() cross-check, so it is parsed even when dump
+    # exits non-zero; the result only counts as a pass if dump exited 0.
     state = {}
-    if r.returncode == 0:
-        for line in r.stdout.splitlines():
-            pg, sl, val = line.split(" ", 2)
-            state[(int(pg), int(sl))] = val
+    for line in r.stdout.splitlines():
+        pg, sl, val = line.split(" ", 2)
+        state[(int(pg), int(sl))] = val
     return r.returncode, state, r.stderr.strip(), r.stdout
 
 
@@ -135,8 +191,9 @@ def main():
     results = open(os.path.join(a.out, "results.jsonl"), "w")
     model, segments, pending_cycles = {}, [], []
     s = {"cycles": 0, "killed_by_sigkill": 0, "exited_before_kill": 0, "killed_before_recovery_marker": 0, "txn_phase_kills": 0,
-         "checks": 0, "pass": 0, "fail": 0, "indoubt_seen": 0, "indoubt_present": 0, "indoubt_absent": 0,
-         "acked_txns": 0, "wal_tail_seen": 0, "stalled_cycles": 0, "killed_before_load": 0, "harness_errors": 0, "pages_redone_total": 0, "pages_redone_max": 0, "first_fail_cycle": None, "resets": 0}
+         "checks": 0, "pass": 0, "fail": 0, "state_mismatch": 0,
+         "indoubt_seen": 0, "indoubt_present": 0, "indoubt_absent": 0, "indoubt_noop": 0,
+         "acked_txns": 0, "startup_checks": 0, "startup_mismatch": 0, "wal_tail_seen": 0, "stalled_cycles": 0, "killed_before_load": 0, "harness_errors": 0, "pages_redone_total": 0, "pages_redone_max": 0, "first_fail_cycle": None, "resets": 0}
     t0 = time.time()
 
     for cyc in range(a.cycles):
@@ -191,10 +248,43 @@ def main():
         rec["indoubt_txn"] = indoubt[0] if indoubt else None
         s["acked_txns"] += len(acked)
         s["indoubt_seen"] += len(indoubt)
+        # The startup scan saw the state left by all earlier cycles: settle it before adding this cycle.
+        startup_bad = False
+        if times["L_crc"] is not None:
+            s["startup_checks"] += 1
+            hit = resolve_startup(model, segments, times["L_rows"], times["L_crc"])
+            if hit is None:
+                startup_bad = True
+                s["startup_mismatch"] += 1
+                rec["startup"] = "mismatch"
+                if s["first_fail_cycle"] is None:
+                    s["first_fail_cycle"] = cyc
+            else:
+                count_indoubt(s, segments, hit[1])
+                rec["startup"] = "match"
+                rec["startup_indoubt_applied"] = hit[1]
+                model, segments, pending_cycles = hit[0], [], []
         for t in order:
             if txns[t]["S"]:
                 segments.append((t, txns[t]["ops"], txns[t]["C"]))
         pending_cycles.append(cyc)
+
+        if startup_bad:
+            # The base state is already impossible, so this cycle's dump cannot be judged: keep the
+            # ledgers and start over from an empty database.
+            fdir = os.path.join(a.out, "fails", f"cycle_{cyc:05d}_startup")
+            os.makedirs(fdir, exist_ok=True)
+            for c in pending_cycles:
+                src = os.path.join(a.out, f"ledger_{c:05d}.txt")
+                if os.path.exists(src):
+                    shutil.copy(src, fdir)
+            shutil.rmtree(db, ignore_errors=True)
+            model, segments, pending_cycles = {}, [], []
+            s["resets"] += 1
+            rec["checked"] = False
+            results.write(json.dumps(rec) + "\n")
+            results.flush()
+            continue
 
         do_check = rc != -signal.SIGKILL or cyc == a.cycles - 1 or random.random() < a.check_prob
         rec["checked"] = do_check
@@ -218,14 +308,14 @@ def main():
             if match is not None:
                 s["pass"] += 1
                 rec["result"] = "pass"
-                n_ind = sum(1 for t, _, d in segments if not d)
-                s["indoubt_present"] += len(match[1])
-                s["indoubt_absent"] += n_ind - len(match[1])
+                count_indoubt(s, segments, match[1])
                 rec["indoubt_applied"] = match[1]
                 model = match[0]
                 rec["live_rows"] = len(model)
             else:
                 s["fail"] += 1
+                if rc == -signal.SIGKILL:
+                    s["state_mismatch"] += 1  # a real mismatch, not just a workload that exited early
                 rec["result"] = "fail"
                 if s["first_fail_cycle"] is None:
                     s["first_fail_cycle"] = cyc
@@ -290,7 +380,8 @@ def main():
 
 
 # What each mode must show. Correct engine and no-fsync (kill -9 cannot see fsync bugs): no
-# mismatch and no exit before the kill. Broken controls: at least one mismatch, else the test is weak.
+# mismatch (in a dump check or at a workload's startup) and no exit before the kill. Broken controls:
+# at least one mismatch of either kind, else the test is weak.
 MUST_MATCH = {"none", "no-fsync"}
 COVERAGE_MIN_TXN_PHASE = 0.5  # at least half the cycles must be killed while transactions run
 
@@ -300,13 +391,17 @@ def verdict(s, a):
     if a.bug in MUST_MATCH:
         if s["fail"]:
             problems.append(f"{s['fail']} mismatches")
+        if s["startup_mismatch"]:
+            problems.append(f"{s['startup_mismatch']} startup mismatches")
         if s["exited_before_kill"]:
             problems.append(f"{s['exited_before_kill']} workload exits before the kill")
-    elif s["fail"] == 0:
-        problems.append("control produced no mismatch")
+    elif s["state_mismatch"] == 0 and s["startup_mismatch"] == 0:
+        problems.append("control produced no mismatch")  # failures from early workload exits do not count
     coverage = []
     if s["checks"] == 0:
         coverage.append("no checks")
+    if s["startup_checks"] == 0:
+        coverage.append("no startup checks")
     if s["acked_txns"] == 0:
         coverage.append("no acknowledged commits")
     if s["indoubt_seen"] == 0:
